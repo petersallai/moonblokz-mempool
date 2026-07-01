@@ -27,7 +27,7 @@
 //! borrowed iteration). Story 2.2 layers the FR33 ownership-differentiated
 //! capacity-pressure eviction on top.
 
-use moonblokz_chain_types::{BlockView, TransactionView, calculate_hash};
+use moonblokz_chain_types::{BlockView, TransactionView};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 
@@ -161,7 +161,7 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         };
         let start = self.byte_usage as usize;
         self.compact_buffer[start..start + tx_len].copy_from_slice(bytes);
-        let tx_hash = calculate_hash(bytes);
+        let tx_hash = tx.hash();
 
         self.index[slot] = Some(IndexEntry {
             start: start as u16,
@@ -208,7 +208,10 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
             let start = entry.start as usize;
             let len = entry.length as usize;
             let tx_bytes = &self.compact_buffer[start..start + len];
-            if &calculate_hash(tx_bytes) == hash {
+            let Some(tx) = TransactionView::from_bytes(tx_bytes) else {
+                continue;
+            };
+            if &tx.hash() == hash {
                 return Some(tx_bytes);
             }
         }
@@ -869,7 +872,7 @@ mod tests {
         let nt = sample_node_transfer(0, 7, 1234);
         let tx_bytes = nt.as_bytes();
         let tx = TransactionView::from_bytes(tx_bytes).unwrap();
-        let hash = calculate_hash(tx_bytes);
+        let hash = nt.hash();
 
         assert!(matches!(
             try_add_test_tx(&mut mp, tx, false),
@@ -904,7 +907,7 @@ mod tests {
         ];
         let mut hashes: [[u8; 32]; 3] = [[0u8; 32]; 3];
         for i in 0..3 {
-            hashes[i] = calculate_hash(nts[i].as_bytes());
+            hashes[i] = nts[i].hash();
             let tx = TransactionView::from_bytes(nts[i].as_bytes()).unwrap();
             assert!(matches!(
                 try_add_test_tx(&mut mp, tx, false),
@@ -1234,7 +1237,7 @@ mod tests {
             AddResult::Admitted
         ));
         let entry = mp.index.iter().find_map(|entry| entry.as_ref()).unwrap();
-        assert_eq!(entry.hash_crc32, crc32_ieee(&calculate_hash(nt.as_bytes())));
+        assert_eq!(entry.hash_crc32, crc32_ieee(&nt.hash()));
         assert_ne!(entry.hash_crc32, crc32_ieee(nt.as_bytes()));
     }
 
