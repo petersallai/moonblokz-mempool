@@ -1,0 +1,13 @@
+[package]
+name = "moonblokz-mempool"
+version = "0.1.0"
+edition = "2024"
+description = "MoonBlokz no_std bounded mempool — compacted byte-buffer + index for pending transactions (FR30)."
+license = "MIT"
+repository = "https://github.com/petersallai/moonblokz-mempool"
+keywords = ["embedded", "no-std", "blockchain", "moonblokz", "mempool"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false, features = ["schnorr-crypto-bigint"] }
+rand_xoshiro = { version = "0.7", default-features = false }
