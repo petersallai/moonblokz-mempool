@@ -8,6 +8,10 @@ repository = "https://github.com/petersallai/moonblokz-mempool"
 keywords = ["embedded", "no-std", "blockchain", "moonblokz", "mempool"]
 categories = ["embedded", "no-std"]
 
+[features]
+default = []
+introspection = []
+
 [dependencies]
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false, features = ["schnorr-crypto-bigint"] }
 rand_xoshiro = { version = "0.7", default-features = false }

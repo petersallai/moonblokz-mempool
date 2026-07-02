@@ -27,9 +27,9 @@
 //! borrowed iteration). Story 2.2 layers the FR33 ownership-differentiated
 //! capacity-pressure eviction on top.
 
-use moonblokz_chain_types::{BlockView, TransactionView};
+use moonblokz_chain_types::{BlockView, MAX_BLOCK_SIZE, TransactionView};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::rand_core::{RngCore, SeedableRng};
 
 /// Sentinel for transactions with no byte-local sequence dependency.
 ///
@@ -77,6 +77,26 @@ pub enum AddResult {
     Rejected,
 }
 
+/// Coarse-grained classification of remaining mempool headroom.
+///
+/// Consumers (Story 7.x FR32 mempool reconciliation, telemetry, tests) read
+/// this to decide whether to preemptively drain deferred entries, throttle
+/// admission, or simply proceed. The exact byte/slot thresholds are
+/// implementation choice; the ordering (`Empty` < `Under` < `Approaching` <
+/// `AtCapacity`) is the load-bearing contract.
+#[cfg(feature = "introspection")]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum CapacityPressure {
+    /// Mempool is empty.
+    Empty,
+    /// Both byte usage and slot usage are below 75%.
+    Under,
+    /// Byte usage or slot usage is between 75% and 95%.
+    Approaching,
+    /// Byte usage ≥ 95% or every index slot is occupied.
+    AtCapacity,
+}
+
 /// Bounded MoonBlokz mempool.
 ///
 /// Const generics:
@@ -93,12 +113,15 @@ pub struct Mempool<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> {
 }
 
 impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES, MAX_ENTRIES> {
+    const COMPACT_BYTES_FITS_MAX_TRANSACTION: () = assert!(COMPACT_BYTES >= MAX_BLOCK_SIZE);
+
     /// Constructs an empty `Mempool` seeded for deterministic-replay
     /// (Story 2.2 eviction PRNG).
     ///
     /// Per FR59, nothing is recovered from durable storage — the mempool is
     /// empty on restart by design.
     pub fn new(sub_seed: u64, own_node_id: u32) -> Self {
+        let _ = Self::COMPACT_BYTES_FITS_MAX_TRANSACTION;
         assert!(
             COMPACT_BYTES <= u16::MAX as usize,
             "COMPACT_BYTES must fit in u16 offsets"
@@ -129,15 +152,55 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         self.byte_usage
     }
 
+    /// Returns the current capacity pressure band.
+    ///
+    /// Combines the byte-usage percentage and the slot-usage percentage —
+    /// the tighter of the two picks the band. See [`CapacityPressure`] for
+    /// band definitions.
+    #[cfg(feature = "introspection")]
+    pub fn capacity_pressure(&self) -> CapacityPressure {
+        if self.entry_count == 0 {
+            return CapacityPressure::Empty;
+        }
+        if (self.entry_count as usize) >= MAX_ENTRIES {
+            return CapacityPressure::AtCapacity;
+        }
+        // Compare against thresholds in u64 to avoid u16 overflow.
+        let bu = self.byte_usage as u64;
+        let cap = COMPACT_BYTES as u64;
+        let ec = self.entry_count as u64;
+        let max_ent = MAX_ENTRIES as u64;
+        let byte_over_95 = bu * 100 >= cap * 95;
+        let slot_over_95 = ec * 100 >= max_ent * 95;
+        if byte_over_95 || slot_over_95 {
+            return CapacityPressure::AtCapacity;
+        }
+        let byte_over_75 = bu * 100 >= cap * 75;
+        let slot_over_75 = ec * 100 >= max_ent * 75;
+        if byte_over_75 || slot_over_75 {
+            return CapacityPressure::Approaching;
+        }
+        CapacityPressure::Under
+    }
+
     /// Attempts to admit `tx` into the mempool.
     ///
-    /// Story 2.1: succeeds when both (a) `byte_usage + tx.len() ≤ COMPACT_BYTES`
-    /// and (b) `entry_count < MAX_ENTRIES`. Otherwise returns `Rejected`.
-    /// Story 2.2 replaces the `Rejected` paths with FR33 capacity-pressure
-    /// eviction.
+    /// **Happy path (Story 2.1):** when both buffer bytes and an index slot
+    /// are available, appends `tx` and returns `Admitted`.
     ///
-    /// The buffer-append + index-write pair is structurally atomic: both
-    /// updates happen after the bounds check, with no intervening panic
+    /// **Capacity pressure (Story 2.2 / FR33):** when the mempool is full,
+    /// dispatches to ownership-differentiated uniform-random eviction:
+    ///
+    /// - **Non-own arriving (Case 1):** every random draw includes the
+    ///   arriving transaction. Existing victims are drawn from the non-own
+    ///   set while it is non-empty, then from own slots if more space is
+    ///   still needed. Drawing the arriving transaction returns `Rejected`.
+    /// - **Own arriving (Case 2):** two-stage drain — first the non-own
+    ///   set, then own slots — until enough space exists. Always admits
+    ///   (invariant: `COMPACT_BYTES ≥ MAX_BLOCK_SIZE`).
+    ///
+    /// The buffer-append + index-write pair remains structurally atomic:
+    /// both updates happen after the space check with no intervening panic
     /// point.
     pub fn try_add(
         &mut self,
@@ -145,19 +208,49 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         transaction_fee: u64,
         is_deferred: bool,
     ) -> AddResult {
+        let tx_len = tx.as_bytes().len();
+        let arriving_is_own = is_own_transaction(&tx, self.own_node_id);
+
+        if tx_len > COMPACT_BYTES {
+            return AddResult::Rejected;
+        }
+
+        if self.has_room_for(tx_len) {
+            return self.insert_tx(tx, transaction_fee, is_deferred, arriving_is_own);
+        }
+
+        if arriving_is_own {
+            self.evict_for_own_arriving(tx, transaction_fee, is_deferred)
+        } else {
+            self.evict_for_non_own_arriving(tx, transaction_fee, is_deferred)
+        }
+    }
+
+    /// Returns `true` iff both the byte buffer and the index have room for
+    /// a transaction of length `tx_len`.
+    fn has_room_for(&self, tx_len: usize) -> bool {
+        self.byte_usage as usize + tx_len <= COMPACT_BYTES
+            && (self.entry_count as usize) < MAX_ENTRIES
+    }
+
+    /// Appends `tx` to the buffer and writes its index entry.
+    ///
+    /// **Precondition:** `self.has_room_for(tx.as_bytes().len())` is `true`.
+    /// The two mutations (buffer copy + index write) are structurally
+    /// atomic — no panic point between the space check and the increments.
+    fn insert_tx(
+        &mut self,
+        tx: TransactionView<'_>,
+        transaction_fee: u64,
+        is_deferred: bool,
+        arriving_is_own: bool,
+    ) -> AddResult {
         let bytes = tx.as_bytes();
         let tx_len = bytes.len();
 
-        if self.byte_usage as usize + tx_len > COMPACT_BYTES {
-            return AddResult::Rejected;
-        }
-        if (self.entry_count as usize) >= MAX_ENTRIES {
-            return AddResult::Rejected;
-        }
-
         let slot = match find_free_slot(&self.index) {
             Some(s) => s,
-            None => return AddResult::Rejected, // unreachable given entry_count check
+            None => return AddResult::Rejected, // unreachable given has_room_for
         };
         let start = self.byte_usage as usize;
         self.compact_buffer[start..start + tx_len].copy_from_slice(bytes);
@@ -170,12 +263,184 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
             transaction_fee,
             expiry_sequence: transaction_expiry_sequence(&tx),
             is_deferred,
-            is_own: is_own_transaction(&tx, self.own_node_id),
+            is_own: arriving_is_own,
         });
 
         self.byte_usage += tx_len as u16;
         self.entry_count += 1;
         AddResult::Admitted
+    }
+
+    /// FR33 Case 1 — non-own arriving transaction, mempool full.
+    ///
+    /// Every random draw includes the arriving transaction as a candidate.
+    /// If the arriving transaction is drawn, it is not admitted and the
+    /// current mempool state is left as-is for that draw. Otherwise the drawn
+    /// existing slot is evicted and compaction runs. Drawing repeats until
+    /// either enough room exists for admission or the arriving transaction is
+    /// drawn.
+    ///
+    /// While non-own slots remain, existing victims are drawn from the non-own
+    /// set plus the arriving transaction. If non-own slots are exhausted and
+    /// more space is still needed, the draw falls back to own slots plus the
+    /// arriving transaction.
+    fn evict_for_non_own_arriving(
+        &mut self,
+        tx: TransactionView<'_>,
+        transaction_fee: u64,
+        is_deferred: bool,
+    ) -> AddResult {
+        let tx_len = tx.as_bytes().len();
+
+        while !self.has_room_for(tx_len) {
+            let non_own_count = self.count_non_own_slots();
+            if non_own_count > 0 {
+                let pick = (self.prng.next_u64() as usize) % (non_own_count + 1);
+                if pick == non_own_count {
+                    return AddResult::Rejected;
+                }
+                let slot = match self.nth_non_own_slot(pick) {
+                    Some(s) => s,
+                    None => return AddResult::Rejected, // unreachable
+                };
+                self.evict_slot(slot);
+                self.compact_after_removal();
+                continue;
+            }
+
+            let own_count = self.count_own_slots();
+            if own_count == 0 {
+                return AddResult::Rejected;
+            }
+            let pick = (self.prng.next_u64() as usize) % (own_count + 1);
+            if pick == own_count {
+                return AddResult::Rejected;
+            }
+            let slot = match self.nth_own_slot(pick) {
+                Some(s) => s,
+                None => return AddResult::Rejected, // unreachable
+            };
+            self.evict_slot(slot);
+            self.compact_after_removal();
+        }
+
+        self.insert_tx(tx, transaction_fee, is_deferred, false)
+    }
+
+    /// FR33 Case 2 — own arriving transaction, mempool full.
+    ///
+    /// Two-stage drain:
+    /// - Stage 1: uniform-random drain from the non-own set until either
+    ///   the arriving tx fits or the non-own set is exhausted.
+    /// - Stage 2: if still short, uniform-random drain from own slots
+    ///   (arriving is not yet in the index, so no exclusion needed) until
+    ///   the arriving tx fits.
+    ///
+    /// Always admits (invariant: `COMPACT_BYTES ≥ MAX_BLOCK_SIZE`, so
+    /// draining down to zero occupants would always free enough space).
+    fn evict_for_own_arriving(
+        &mut self,
+        tx: TransactionView<'_>,
+        transaction_fee: u64,
+        is_deferred: bool,
+    ) -> AddResult {
+        let tx_len = tx.as_bytes().len();
+
+        // Stage 1: drain non-own
+        while !self.has_room_for(tx_len) {
+            let non_own_count = self.count_non_own_slots();
+            if non_own_count == 0 {
+                break;
+            }
+            let pick = (self.prng.next_u64() as usize) % non_own_count;
+            let slot = match self.nth_non_own_slot(pick) {
+                Some(s) => s,
+                None => break, // unreachable given non_own_count > 0
+            };
+            self.evict_slot(slot);
+            self.compact_after_removal();
+        }
+
+        // Stage 2: drain own if still short
+        while !self.has_room_for(tx_len) {
+            let own_count = self.count_own_slots();
+            if own_count == 0 {
+                // Would only happen if COMPACT_BYTES < tx_len — violates the
+                // "COMPACT_BYTES ≥ MAX_BLOCK_SIZE" invariant. Defensive break
+                // so we don't loop forever.
+                break;
+            }
+            let pick = (self.prng.next_u64() as usize) % own_count;
+            let slot = match self.nth_own_slot(pick) {
+                Some(s) => s,
+                None => break,
+            };
+            self.evict_slot(slot);
+            self.compact_after_removal();
+        }
+
+        // Always admit for Case 2. If the invariant was violated and no
+        // room could be made, `insert_tx` returns `Rejected` — defensive
+        // fallback, not an expected path.
+        self.insert_tx(tx, transaction_fee, is_deferred, true)
+    }
+
+    /// Number of slots occupied by own transactions.
+    fn count_own_slots(&self) -> usize {
+        self.index
+            .iter()
+            .filter(|e| matches!(e, Some(entry) if entry.is_own))
+            .count()
+    }
+
+    /// Number of slots occupied by non-own transactions.
+    fn count_non_own_slots(&self) -> usize {
+        self.index
+            .iter()
+            .filter(|e| matches!(e, Some(entry) if !entry.is_own))
+            .count()
+    }
+
+    /// Returns the slot index of the `n`-th own transaction (0-indexed).
+    fn nth_own_slot(&self, n: usize) -> Option<usize> {
+        let mut counter = 0usize;
+        for (i, e) in self.index.iter().enumerate() {
+            if let Some(entry) = e {
+                if entry.is_own {
+                    if counter == n {
+                        return Some(i);
+                    }
+                    counter += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the slot index of the `n`-th non-own transaction (0-indexed).
+    fn nth_non_own_slot(&self, n: usize) -> Option<usize> {
+        let mut counter = 0usize;
+        for (i, e) in self.index.iter().enumerate() {
+            if let Some(entry) = e {
+                if !entry.is_own {
+                    if counter == n {
+                        return Some(i);
+                    }
+                    counter += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Nulls out a slot without compacting. Caller must invoke
+    /// [`Mempool::compact_after_removal`] to restore the FR30 contiguous-
+    /// storage invariant.
+    fn evict_slot(&mut self, slot: usize) {
+        if self.index[slot].is_some() {
+            self.index[slot] = None;
+            self.entry_count -= 1;
+        }
     }
 
     /// Lookup by canonical transaction hash. Returns a borrowed view into
@@ -656,7 +921,7 @@ mod tests {
 
     // Test instance parameters: small COMPACT_BYTES and MAX_ENTRIES so we
     // can exercise the buffer-full / index-full rejection paths cheaply.
-    const TEST_COMPACT_BYTES: usize = 1024;
+    const TEST_COMPACT_BYTES: usize = 2048;
     const TEST_MAX_ENTRIES: usize = 8;
     type TestMempool = Mempool<TEST_COMPACT_BYTES, TEST_MAX_ENTRIES>;
 
@@ -795,7 +1060,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "MAX_ENTRIES must fit in the u8 entry_count")]
     fn new_rejects_unsupported_entry_count() {
-        let _mp: Mempool<1024, 256> = Mempool::new(0x1234, 42);
+        let _mp: Mempool<2048, 256> = Mempool::new(0x1234, 42);
     }
 
     #[test]
@@ -821,49 +1086,91 @@ mod tests {
     }
 
     #[test]
-    fn try_add_rejects_on_index_full() {
+    fn try_add_at_index_full_triggers_case_1a_eviction() {
+        // Story 2.2 semantics: when the mempool is at capacity, a non-own
+        // arriving transaction triggers FR33 Case 1a — evict one uniform-
+        // random non-own slot, admit arriving. `entry_count` stays at cap.
         let mut mp = TestMempool::new(0x1234, 42);
-        let nt = sample_node_transfer(0, 1, 100);
-        let tx_bytes = nt.as_bytes();
+        let mut nt_makers: [NodeTransfer; TEST_MAX_ENTRIES] = core::array::from_fn(|i| {
+            sample_node_transfer(0, 1, 100 + i as u64) // initializer=1 ≠ own_node_id=42; distinct amounts
+        });
+        let _ = &mut nt_makers; // silence unused-mut on newer Rust
 
-        // Fill all MAX_ENTRIES slots.
-        for _ in 0..TEST_MAX_ENTRIES {
-            let tx = TransactionView::from_bytes(tx_bytes).unwrap();
+        // Fill all MAX_ENTRIES slots with non-own txs.
+        for nt in nt_makers.iter() {
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
             assert!(matches!(
                 try_add_test_tx(&mut mp, tx, false),
                 AddResult::Admitted
             ));
         }
-        // Next add must be Rejected (index full; buffer might also be full).
-        let tx = TransactionView::from_bytes(tx_bytes).unwrap();
+        assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+
+        // Non-own arriving: Case 1a → eviction + admission.
+        let arriving = sample_node_transfer(0, 1, 999);
+        let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
         assert!(matches!(
-            try_add_test_tx(&mut mp, tx, false),
-            AddResult::Rejected
+            try_add_test_tx(&mut mp, arriving_view, false),
+            AddResult::Admitted
         ));
         assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+        // Arriving is now in the mempool.
+        let arriving_hash = TransactionView::from_bytes(arriving.as_bytes())
+            .unwrap()
+            .hash();
+        assert!(mp.contains(&arriving_hash));
     }
 
     #[test]
-    fn try_add_rejects_on_buffer_overflow() {
-        // Use a single-entry-fitting capacity to force buffer-overflow path
-        // before index-full path.
-        const TINY: usize = 200; // smaller than 2 × NODE_TRANSFER_SIZE (~202)
-        let mut mp: Mempool<TINY, 8> = Mempool::new(0x1234, 42);
-        let nt = sample_node_transfer(0, 1, 100);
-        let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+    fn try_add_at_buffer_full_triggers_case_1a_eviction() {
+        // Use the minimum compile-time-supported capacity and enough slots so
+        // bytes, not the index, are the limiting bound. Ten registrations fit
+        // (10 × 189 = 1890); an eleventh would exceed 2048 bytes.
+        const MIN_BYTES: usize = MAX_BLOCK_SIZE;
+        let mut mp: Mempool<MIN_BYTES, 32> = Mempool::new(0x1001, 42);
+        for i in 0..10 {
+            let reg = sample_registration(100 + i as u32); // non-own
+            let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
+            assert!(matches!(
+                try_add_test_tx(&mut mp, tx, false),
+                AddResult::Admitted
+            ));
+        }
+        assert_eq!(mp.entry_count(), 10);
+        assert!(mp.byte_usage() as usize + REGISTRATION_SIZE > MIN_BYTES);
 
-        // First add succeeds.
-        assert!(matches!(
-            try_add_test_tx(&mut mp, tx, false),
-            AddResult::Admitted
-        ));
-        // Second add fails on buffer overflow (NODE_TRANSFER_SIZE = 101; 101+101 > 200).
-        let tx2 = TransactionView::from_bytes(nt.as_bytes()).unwrap();
-        assert!(matches!(
-            try_add_test_tx(&mut mp, tx2, false),
-            AddResult::Rejected
-        ));
-        assert_eq!(mp.entry_count(), 1);
+        // Find a deterministic seed whose first Case 1 draw evicts an
+        // existing non-own entry rather than selecting the arriving tx.
+        let mut admitted = false;
+        for seed in 0..256u64 {
+            let mut candidate: Mempool<MIN_BYTES, 32> = Mempool::new(seed, 42);
+            for i in 0..10 {
+                let reg = sample_registration(100 + i as u32);
+                let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
+                let _ = try_add_test_tx(&mut candidate, tx, false);
+            }
+            let arriving = sample_registration(999);
+            let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
+            if matches!(
+                try_add_test_tx(&mut candidate, arriving_view, false),
+                AddResult::Admitted
+            ) {
+                admitted = true;
+                assert_eq!(candidate.entry_count(), 10);
+                assert!(
+                    candidate.contains(
+                        &TransactionView::from_bytes(arriving.as_bytes())
+                            .unwrap()
+                            .hash()
+                    )
+                );
+                break;
+            }
+        }
+        assert!(
+            admitted,
+            "at least one seed in the search window must admit"
+        );
     }
 
     #[test]
@@ -1515,5 +1822,247 @@ mod tests {
         mp.recheck_eligibility(|_| 200u64); // 200 ≥ 100 + 1 → eligible
         let entry = mp.index.iter().find_map(|e| e.as_ref()).unwrap();
         assert!(!entry.is_deferred);
+    }
+
+    // ============ Story 2.2 tests ============
+
+    #[cfg(feature = "introspection")]
+    #[test]
+    fn capacity_pressure_reports_empty() {
+        let mp = TestMempool::new(0x1234, 42);
+        assert!(mp.capacity_pressure() == CapacityPressure::Empty);
+    }
+
+    #[cfg(feature = "introspection")]
+    #[test]
+    fn capacity_pressure_reports_at_capacity_by_slots() {
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..TEST_MAX_ENTRIES {
+            let nt = sample_node_transfer(0, 1, 100 + i as u64);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            assert!(matches!(
+                try_add_test_tx(&mut mp, tx, false),
+                AddResult::Admitted
+            ));
+        }
+        assert!(mp.capacity_pressure() == CapacityPressure::AtCapacity);
+    }
+
+    #[cfg(feature = "introspection")]
+    #[test]
+    fn capacity_pressure_reports_under_and_approaching_bands() {
+        // A single small tx in a 1024-byte / 8-slot test mempool → Under.
+        let mut mp = TestMempool::new(0x1234, 42);
+        let nt = sample_node_transfer(0, 1, 100);
+        let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+        assert!(matches!(
+            try_add_test_tx(&mut mp, tx, false),
+            AddResult::Admitted
+        ));
+        assert!(mp.capacity_pressure() == CapacityPressure::Under);
+
+        // Fill to ≥75% slot usage but under 95%. Test slot ratio: 8 slots
+        // total, 6 filled → 75%. That is the boundary; add exactly 6 to
+        // ensure ≥75% but under 95% (8 = 100%).
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..6 {
+            let nt = sample_node_transfer(0, 1, 100 + i as u64);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        assert!(mp.capacity_pressure() == CapacityPressure::Approaching);
+    }
+
+    #[test]
+    fn case_1a_evicts_non_own_and_admits_non_own_arriving() {
+        // Own_node_id = 42; fill with non-own txs (initializer = 1), then
+        // arrive with another non-own. Case 1a — one non-own evicted.
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..TEST_MAX_ENTRIES {
+            let nt = sample_node_transfer(0, 1, 100 + i as u64);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        let arriving = sample_node_transfer(0, 1, 9999);
+        let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
+        assert!(matches!(
+            try_add_test_tx(&mut mp, arriving_view, false),
+            AddResult::Admitted
+        ));
+        // Arriving is present; overall entry_count unchanged.
+        assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+        let arriving_hash = TransactionView::from_bytes(arriving.as_bytes())
+            .unwrap()
+            .hash();
+        assert!(mp.contains(&arriving_hash));
+    }
+
+    #[test]
+    fn case_1b_own_only_mempool_arriving_non_own_seed_hits_own_or_arriving() {
+        // Fill mempool with own txs (initializer = own_node_id = 42), then
+        // arrive with a non-own tx (initializer = 1). The draw picks from
+        // {own_slots ∪ arriving}: total = own_count + 1. Depending on the
+        // seed, either an own slot is evicted (Admitted) or the arriving is
+        // drawn (Rejected).
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..TEST_MAX_ENTRIES {
+            let nt = sample_node_transfer(0, 42, 100 + i as u64); // own
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        assert_eq!(mp.count_own_slots(), TEST_MAX_ENTRIES);
+        assert_eq!(mp.count_non_own_slots(), 0);
+
+        let arriving = sample_node_transfer(0, 1, 9999); // non-own
+        let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
+        let result = try_add_test_tx(&mut mp, arriving_view, false);
+        // Result is deterministic under fixed seed — either Admitted (own
+        // evicted) or Rejected (arriving drawn). Both are valid Case 1b
+        // outcomes; the test verifies the class, not the specific outcome.
+        match result {
+            AddResult::Admitted => {
+                // The arriving must have replaced an own slot.
+                assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+                assert!(mp.count_non_own_slots() == 1);
+                assert!(mp.count_own_slots() == TEST_MAX_ENTRIES - 1);
+            }
+            AddResult::Rejected => {
+                // Mempool unchanged.
+                assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+                assert_eq!(mp.count_own_slots(), TEST_MAX_ENTRIES);
+                assert_eq!(mp.count_non_own_slots(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn case_2_own_arriving_stage_1_drains_non_own() {
+        // Mix: 4 non-own + 4 own = 8 (TEST_MAX_ENTRIES). Own arriving.
+        // Stage 1 must drain a non-own; the arriving tx admitted.
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..4 {
+            let nt = sample_node_transfer(0, 1, 100 + i as u64); // non-own
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        for i in 0..4 {
+            let nt = sample_node_transfer(0, 42, 500 + i as u64); // own
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        assert_eq!(mp.count_own_slots(), 4);
+        assert_eq!(mp.count_non_own_slots(), 4);
+
+        let arriving = sample_node_transfer(0, 42, 9999); // own
+        let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
+        assert!(matches!(
+            try_add_test_tx(&mut mp, arriving_view, false),
+            AddResult::Admitted
+        ));
+        // Non-own count must have decreased (Stage 1 drained ≥ 1).
+        assert!(mp.count_non_own_slots() < 4);
+        // Arriving present.
+        let arriving_hash = TransactionView::from_bytes(arriving.as_bytes())
+            .unwrap()
+            .hash();
+        assert!(mp.contains(&arriving_hash));
+    }
+
+    #[test]
+    fn case_2_own_arriving_stage_2_drains_own_when_no_non_own() {
+        // Fill with own txs only, then own arriving. Stage 1 does nothing
+        // (no non-own), Stage 2 drains one own.
+        let mut mp = TestMempool::new(0x1234, 42);
+        for i in 0..TEST_MAX_ENTRIES {
+            let nt = sample_node_transfer(0, 42, 100 + i as u64); // own
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        assert_eq!(mp.count_own_slots(), TEST_MAX_ENTRIES);
+
+        let arriving = sample_node_transfer(0, 42, 9999); // own
+        let arriving_view = TransactionView::from_bytes(arriving.as_bytes()).unwrap();
+        assert!(matches!(
+            try_add_test_tx(&mut mp, arriving_view, false),
+            AddResult::Admitted
+        ));
+        // Arriving present.
+        let arriving_hash = TransactionView::from_bytes(arriving.as_bytes())
+            .unwrap()
+            .hash();
+        assert!(mp.contains(&arriving_hash));
+        // Still MAX_ENTRIES total — Stage 2 evicted exactly one own to make
+        // room for arriving.
+        assert_eq!(mp.entry_count() as usize, TEST_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn eviction_deterministic_from_seed() {
+        // Two mempools with identical seed + identical op sequence must
+        // reach identical state.
+        fn run_ops(
+            seed: u64,
+        ) -> (
+            [Option<(u64, u32, u32, u32, u16, u16)>; TEST_MAX_ENTRIES],
+            u16,
+            u8,
+        ) {
+            let mut mp = TestMempool::new(seed, 42);
+            // Fill with a mix of own and non-own
+            for i in 0..TEST_MAX_ENTRIES {
+                let initializer = if i % 2 == 0 { 1 } else { 42 };
+                let nt = sample_node_transfer(0, initializer, 100 + i as u64);
+                let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+                let _ = try_add_test_tx(&mut mp, tx, false);
+            }
+            // Add 3 more txs to trigger evictions
+            for i in 0..3 {
+                let nt = sample_node_transfer(0, 42, 9000 + i as u64);
+                let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+                let _ = try_add_test_tx(&mut mp, tx, false);
+            }
+            let mut snapshot: [Option<(u64, u32, u32, u32, u16, u16)>; TEST_MAX_ENTRIES] =
+                [None; TEST_MAX_ENTRIES];
+            for (i, e) in mp.index.iter().enumerate() {
+                snapshot[i] = e.as_ref().map(|entry| {
+                    (
+                        entry.transaction_fee,
+                        entry.hash_crc32,
+                        entry.expiry_sequence,
+                        if entry.is_own { 1 } else { 0 },
+                        entry.start,
+                        entry.length,
+                    )
+                });
+            }
+            (snapshot, mp.byte_usage(), mp.entry_count())
+        }
+
+        let a = run_ops(0xDEAD_BEEF);
+        let b = run_ops(0xDEAD_BEEF);
+        assert_eq!(a.1, b.1, "byte_usage must match under identical seed");
+        assert_eq!(a.2, b.2, "entry_count must match under identical seed");
+        assert_eq!(a.0, b.0, "index contents must match under identical seed");
+    }
+
+    #[test]
+    fn eviction_preserves_contiguous_storage_invariant() {
+        let mut mp = TestMempool::new(0xF00D, 42);
+        // Fill mixed
+        for i in 0..TEST_MAX_ENTRIES {
+            let initializer = if i % 3 == 0 { 42 } else { 1 };
+            let nt = sample_node_transfer(0, initializer, 100 + i as u64);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+        }
+        check_invariant(&mp);
+
+        // Trigger 5 evictions with own-arriving (Case 2)
+        for i in 0..5 {
+            let nt = sample_node_transfer(0, 42, 9000 + i as u64);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            let _ = try_add_test_tx(&mut mp, tx, false);
+            check_invariant(&mp);
+        }
     }
 }
