@@ -8,8 +8,8 @@
 //! **Leaf-crate discipline.** Depends only on `moonblokz-chain-types`
 //! (`TransactionView<'_>`) and `rand_xoshiro` (Story 2.2 eviction PRNG).
 //! **No** dependency on `moonblokz-blockchain` — the blockchain hands a
-//! caller-derived `sub_seed: u64` to [`Mempool::new`] and the mempool runs
-//! standalone.
+//! caller-derived `sub_seed: u64` to [`Mempool::init_in_place`] and the
+//! mempool runs standalone.
 //!
 //! ## Storage contract (FR30)
 //!
@@ -115,12 +115,37 @@ pub struct Mempool<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> {
 impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES, MAX_ENTRIES> {
     const COMPACT_BYTES_FITS_MAX_TRANSACTION: () = assert!(COMPACT_BYTES >= MAX_BLOCK_SIZE);
 
-    /// Constructs an empty `Mempool` seeded for deterministic-replay
-    /// (Story 2.2 eviction PRNG).
+    /// In-place construction for embedded/task use, and this type's **only**
+    /// constructor: writes directly into caller-provided `dst` instead of
+    /// returning `Self` by value.
+    ///
+    /// `compact_buffer` alone is ~20 KB at the architecture §5 default
+    /// (`COMPACT_BYTES = 20160`) — large enough that, like
+    /// `moonblokz_blockchain::api::Blockchain`, no construction technique
+    /// *inside* a function that returns `Self` by value can avoid a
+    /// transient `size_of::<Self>()`-sized stack allocation somewhere. A
+    /// by-value `new()` existed earlier and was fine for the desktop
+    /// simulator and for tests, but it was removed once every caller was
+    /// confirmed able to use this constructor instead (same rationale as
+    /// `moonblokz_blockchain::api::Blockchain::init_in_place`'s doc comment).
+    /// See that type's `init_in_place` doc comment for the full mechanism
+    /// and the required usage pattern: call this from *inside* a
+    /// `#[embassy_executor::task]` fn, with the destination `MaybeUninit`
+    /// declared as a task-local kept alive across an `.await` — that is
+    /// what makes Rust's async state-machine lowering place it in the
+    /// task's static `TaskStorage` rather than the shared poll-time call
+    /// stack.
     ///
     /// Per FR59, nothing is recovered from durable storage — the mempool is
     /// empty on restart by design.
-    pub fn new(sub_seed: u64, own_node_id: u32) -> Self {
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `Self` and not yet initialized.
+    /// Every field is written exactly once; no field is read before its
+    /// write. The precondition asserts run before any write, so a panic
+    /// there cannot leave `dst` partially initialized.
+    pub unsafe fn init_in_place(dst: *mut Self, sub_seed: u64, own_node_id: u32) {
+        #[allow(clippy::let_unit_value)]
         let _ = Self::COMPACT_BYTES_FITS_MAX_TRANSACTION;
         assert!(
             COMPACT_BYTES <= u16::MAX as usize,
@@ -131,13 +156,39 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
             "MAX_ENTRIES must fit in the u8 entry_count"
         );
 
-        Self {
-            compact_buffer: [0u8; COMPACT_BYTES],
-            index: [None; MAX_ENTRIES],
-            prng: Xoshiro256PlusPlus::seed_from_u64(sub_seed),
-            byte_usage: 0,
-            entry_count: 0,
-            own_node_id,
+        unsafe {
+            // Plain all-zero byte buffer: `write_bytes` (memset) is both
+            // correct (no representation ambiguity for `u8`) and never
+            // materializes a `COMPACT_BYTES`-sized value anywhere, unlike
+            // a bulk `.write([0u8; COMPACT_BYTES])` would.
+            let compact_buffer_ptr = core::ptr::addr_of_mut!((*dst).compact_buffer) as *mut u8;
+            compact_buffer_ptr.write_bytes(0u8, COMPACT_BYTES);
+
+            // `Option<IndexEntry>` has no guaranteed niche (`IndexEntry`
+            // has no `NonZero`/reference field), so `None`'s bit pattern
+            // isn't something safe code may assume is all-zero — write
+            // real `None` values one at a time instead of memsetting.
+            let index_ptr = core::ptr::addr_of_mut!((*dst).index) as *mut Option<IndexEntry>;
+            for i in 0..MAX_ENTRIES {
+                index_ptr.add(i).write(None);
+            }
+
+            core::ptr::addr_of_mut!((*dst).prng).write(Xoshiro256PlusPlus::seed_from_u64(sub_seed));
+            core::ptr::addr_of_mut!((*dst).byte_usage).write(0);
+            core::ptr::addr_of_mut!((*dst).entry_count).write(0);
+            core::ptr::addr_of_mut!((*dst).own_node_id).write(own_node_id);
+        }
+    }
+
+    /// Test-only stand-in for the deleted by-value `new()`: wraps the
+    /// `MaybeUninit` + `init_in_place` + `assume_init()` calling convention
+    /// once so individual tests don't each repeat `unsafe` code.
+    #[cfg(test)]
+    fn new_for_test(sub_seed: u64, own_node_id: u32) -> Self {
+        let mut slot = core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            Self::init_in_place(slot.as_mut_ptr(), sub_seed, own_node_id);
+            slot.assume_init()
         }
     }
 
@@ -1051,29 +1102,46 @@ mod tests {
         }
     }
 
+    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
+    /// `compact_buffer` filled via `write_bytes`, `index` filled
+    /// element-by-element) must land every field in its correct default
+    /// state — verified directly rather than trusted by construction.
     #[test]
-    #[should_panic(expected = "COMPACT_BYTES must fit in u16 offsets")]
-    fn new_rejects_unsupported_compact_bytes() {
-        let _mp: Mempool<65536, 8> = Mempool::new(0x1234, 42);
-    }
+    fn init_in_place_sets_expected_defaults() {
+        let mut result = core::mem::MaybeUninit::<TestMempool>::uninit();
+        let mp = unsafe {
+            TestMempool::init_in_place(result.as_mut_ptr(), 0xDEAD_BEEF, 7);
+            result.assume_init()
+        };
 
-    #[test]
-    #[should_panic(expected = "MAX_ENTRIES must fit in the u8 entry_count")]
-    fn new_rejects_unsupported_entry_count() {
-        let _mp: Mempool<2048, 256> = Mempool::new(0x1234, 42);
-    }
-
-    #[test]
-    fn new_empty_state() {
-        let mp = TestMempool::new(0x1234, 42);
         assert_eq!(mp.entry_count(), 0);
         assert_eq!(mp.byte_usage(), 0);
+        assert_eq!(mp.own_node_id, 7);
+        assert!(mp.compact_buffer.iter().all(|&b| b == 0));
         assert!(mp.index.iter().all(|e| e.is_none()));
     }
 
     #[test]
+    #[should_panic(expected = "COMPACT_BYTES must fit in u16 offsets")]
+    fn init_in_place_rejects_unsupported_compact_bytes() {
+        let mut result = core::mem::MaybeUninit::<Mempool<65536, 8>>::uninit();
+        unsafe {
+            Mempool::<65536, 8>::init_in_place(result.as_mut_ptr(), 0x1234, 42);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_ENTRIES must fit in the u8 entry_count")]
+    fn init_in_place_rejects_unsupported_entry_count() {
+        let mut result = core::mem::MaybeUninit::<Mempool<2048, 256>>::uninit();
+        unsafe {
+            Mempool::<2048, 256>::init_in_place(result.as_mut_ptr(), 0x1234, 42);
+        }
+    }
+
+    #[test]
     fn try_add_admits_when_space_available() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer(0, 1, 100);
         let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
 
@@ -1090,7 +1158,7 @@ mod tests {
         // Story 2.2 semantics: when the mempool is at capacity, a non-own
         // arriving transaction triggers FR33 Case 1a — evict one uniform-
         // random non-own slot, admit arriving. `entry_count` stays at cap.
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let mut nt_makers: [NodeTransfer; TEST_MAX_ENTRIES] = core::array::from_fn(|i| {
             sample_node_transfer(0, 1, 100 + i as u64) // initializer=1 ≠ own_node_id=42; distinct amounts
         });
@@ -1127,7 +1195,7 @@ mod tests {
         // bytes, not the index, are the limiting bound. Ten registrations fit
         // (10 × 189 = 1890); an eleventh would exceed 2048 bytes.
         const MIN_BYTES: usize = MAX_BLOCK_SIZE;
-        let mut mp: Mempool<MIN_BYTES, 32> = Mempool::new(0x1001, 42);
+        let mut mp: Mempool<MIN_BYTES, 32> = Mempool::new_for_test(0x1001, 42);
         for i in 0..10 {
             let reg = sample_registration(100 + i as u32); // non-own
             let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
@@ -1143,7 +1211,7 @@ mod tests {
         // existing non-own entry rather than selecting the arriving tx.
         let mut admitted = false;
         for seed in 0..256u64 {
-            let mut candidate: Mempool<MIN_BYTES, 32> = Mempool::new(seed, 42);
+            let mut candidate: Mempool<MIN_BYTES, 32> = Mempool::new_for_test(seed, 42);
             for i in 0..10 {
                 let reg = sample_registration(100 + i as u32);
                 let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
@@ -1175,7 +1243,7 @@ mod tests {
 
     #[test]
     fn get_by_hash_returns_borrowed_view() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer(0, 7, 1234);
         let tx_bytes = nt.as_bytes();
         let tx = TransactionView::from_bytes(tx_bytes).unwrap();
@@ -1199,14 +1267,14 @@ mod tests {
 
     #[test]
     fn contains_returns_false_for_absent() {
-        let mp = TestMempool::new(0x1234, 42);
+        let mp = TestMempool::new_for_test(0x1234, 42);
         let fake_hash = [0u8; 32];
         assert!(!mp.contains(&fake_hash));
     }
 
     #[test]
     fn confirm_by_block_acceptance_compacts() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nts: [NodeTransfer; 3] = [
             sample_node_transfer(1, 1, 100),
             sample_node_transfer(2, 2, 200),
@@ -1241,7 +1309,7 @@ mod tests {
 
     #[test]
     fn confirm_by_block_acceptance_compacts_multiple_gaps_and_clears_tail() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt_a = sample_node_transfer(1, 42, 100);
         let reg_b = sample_registration_with_fee(7, 2);
         let nt_c = sample_node_transfer(3, 3, 300);
@@ -1331,7 +1399,7 @@ mod tests {
 
     #[test]
     fn confirm_by_block_acceptance_all_removed_clears_index_and_buffer() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt_a = sample_node_transfer(1, 1, 100);
         let nt_b = sample_node_transfer(2, 2, 200);
 
@@ -1373,7 +1441,7 @@ mod tests {
 
     #[test]
     fn contiguous_storage_invariant_after_arbitrary_ops() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt_a = sample_node_transfer(1, 1, 100);
         let nt_b = sample_node_transfer(2, 2, 200);
         let nt_c = sample_node_transfer(3, 3, 300);
@@ -1517,7 +1585,7 @@ mod tests {
 
     #[test]
     fn try_add_records_expiry_sequence() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer_with_anchor(11, 22, 42, 100);
         assert!(matches!(
             try_add_test_tx(
@@ -1533,7 +1601,7 @@ mod tests {
 
     #[test]
     fn try_add_records_hash_crc32() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer_with_anchor(11, 22, 42, 100);
         assert!(matches!(
             try_add_test_tx(
@@ -1550,7 +1618,7 @@ mod tests {
 
     #[test]
     fn try_add_records_supplied_transaction_fee_and_top_n_returns_it() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer_with_fee(0, 5, 100, 1);
         assert!(matches!(
             mp.try_add(
@@ -1580,7 +1648,7 @@ mod tests {
 
     #[test]
     fn try_add_records_own_classification() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let own = sample_node_transfer(0, 42, 100);
         let non_own = sample_node_transfer(0, 7, 100);
 
@@ -1612,7 +1680,7 @@ mod tests {
 
     #[test]
     fn recheck_eligibility_flips_deferred_flag() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer(0, 5, 1000); // initializer = 5, amount = 1000, fee = 1
         let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
         assert!(matches!(
@@ -1633,7 +1701,7 @@ mod tests {
 
     #[test]
     fn eligible_iter_filters_deferred() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt_a = sample_node_transfer(1, 1, 100);
         let nt_b = sample_node_transfer(2, 2, 200);
         let tx_a = TransactionView::from_bytes(nt_a.as_bytes()).unwrap();
@@ -1653,7 +1721,7 @@ mod tests {
 
     #[test]
     fn top_n_for_exchange_no_alloc_no_mutation() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer(1, 1, 100);
         for _ in 0..5 {
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1667,7 +1735,7 @@ mod tests {
 
     #[test]
     fn top_n_for_exchange_orders_by_fee_per_byte() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let higher_rate = sample_node_transfer_with_fee(1, 7, 100, 600); // 600 / 101
         let lower_rate = sample_registration_with_fee(2, 1000); // 1000 / 189
 
@@ -1701,7 +1769,7 @@ mod tests {
 
     #[test]
     fn top_n_for_exchange_prefers_own_on_equal_fee_per_byte() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let other = sample_node_transfer_with_fee(1, 7, 100, 5);
         let own = sample_node_transfer_with_fee(2, 42, 100, 5);
 
@@ -1734,7 +1802,7 @@ mod tests {
 
     #[test]
     fn top_n_for_exchange_uses_hash_crc32_tie_break() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let higher_crc = sample_node_transfer_with_fee(1, 7, 100, 5);
         let lower_crc = sample_node_transfer_with_fee(2, 7, 100, 5);
 
@@ -1770,7 +1838,7 @@ mod tests {
 
     #[test]
     fn top_n_for_exchange_uses_lexicographic_bytes_on_hash_crc32_tie() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let lex_larger = sample_node_transfer_with_fee(2, 7, 100, 5);
         let lex_smaller = sample_node_transfer_with_fee(1, 7, 100, 5);
         assert!(lex_smaller.as_bytes() < lex_larger.as_bytes());
@@ -1807,7 +1875,7 @@ mod tests {
 
     #[test]
     fn registration_eligibility_check() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let reg = sample_registration(7); // initializer = 0, registration_price = 100, fee = 1
         let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
         assert!(matches!(
@@ -1829,14 +1897,14 @@ mod tests {
     #[cfg(feature = "introspection")]
     #[test]
     fn capacity_pressure_reports_empty() {
-        let mp = TestMempool::new(0x1234, 42);
+        let mp = TestMempool::new_for_test(0x1234, 42);
         assert!(mp.capacity_pressure() == CapacityPressure::Empty);
     }
 
     #[cfg(feature = "introspection")]
     #[test]
     fn capacity_pressure_reports_at_capacity_by_slots() {
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..TEST_MAX_ENTRIES {
             let nt = sample_node_transfer(0, 1, 100 + i as u64);
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1852,7 +1920,7 @@ mod tests {
     #[test]
     fn capacity_pressure_reports_under_and_approaching_bands() {
         // A single small tx in a 1024-byte / 8-slot test mempool → Under.
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         let nt = sample_node_transfer(0, 1, 100);
         let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
         assert!(matches!(
@@ -1864,7 +1932,7 @@ mod tests {
         // Fill to ≥75% slot usage but under 95%. Test slot ratio: 8 slots
         // total, 6 filled → 75%. That is the boundary; add exactly 6 to
         // ensure ≥75% but under 95% (8 = 100%).
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..6 {
             let nt = sample_node_transfer(0, 1, 100 + i as u64);
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1877,7 +1945,7 @@ mod tests {
     fn case_1a_evicts_non_own_and_admits_non_own_arriving() {
         // Own_node_id = 42; fill with non-own txs (initializer = 1), then
         // arrive with another non-own. Case 1a — one non-own evicted.
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..TEST_MAX_ENTRIES {
             let nt = sample_node_transfer(0, 1, 100 + i as u64);
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1904,7 +1972,7 @@ mod tests {
         // {own_slots ∪ arriving}: total = own_count + 1. Depending on the
         // seed, either an own slot is evicted (Admitted) or the arriving is
         // drawn (Rejected).
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..TEST_MAX_ENTRIES {
             let nt = sample_node_transfer(0, 42, 100 + i as u64); // own
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1939,7 +2007,7 @@ mod tests {
     fn case_2_own_arriving_stage_1_drains_non_own() {
         // Mix: 4 non-own + 4 own = 8 (TEST_MAX_ENTRIES). Own arriving.
         // Stage 1 must drain a non-own; the arriving tx admitted.
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..4 {
             let nt = sample_node_transfer(0, 1, 100 + i as u64); // non-own
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -1972,7 +2040,7 @@ mod tests {
     fn case_2_own_arriving_stage_2_drains_own_when_no_non_own() {
         // Fill with own txs only, then own arriving. Stage 1 does nothing
         // (no non-own), Stage 2 drains one own.
-        let mut mp = TestMempool::new(0x1234, 42);
+        let mut mp = TestMempool::new_for_test(0x1234, 42);
         for i in 0..TEST_MAX_ENTRIES {
             let nt = sample_node_transfer(0, 42, 100 + i as u64); // own
             let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
@@ -2007,7 +2075,7 @@ mod tests {
             u16,
             u8,
         ) {
-            let mut mp = TestMempool::new(seed, 42);
+            let mut mp = TestMempool::new_for_test(seed, 42);
             // Fill with a mix of own and non-own
             for i in 0..TEST_MAX_ENTRIES {
                 let initializer = if i % 2 == 0 { 1 } else { 42 };
@@ -2047,7 +2115,7 @@ mod tests {
 
     #[test]
     fn eviction_preserves_contiguous_storage_invariant() {
-        let mut mp = TestMempool::new(0xF00D, 42);
+        let mut mp = TestMempool::new_for_test(0xF00D, 42);
         // Fill mixed
         for i in 0..TEST_MAX_ENTRIES {
             let initializer = if i % 3 == 0 { 42 } else { 1 };
