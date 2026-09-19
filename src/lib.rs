@@ -8,7 +8,7 @@
 //! **Leaf-crate discipline.** Depends only on `moonblokz-chain-types`
 //! (`TransactionView<'_>`) and `rand_xoshiro` (Story 2.2 eviction PRNG).
 //! **No** dependency on `moonblokz-blockchain` — the blockchain hands a
-//! caller-derived `sub_seed: u64` to [`Mempool::init_in_place`] and the
+//! caller-derived `sub_seed: u64` to [`Mempool::init`] and the
 //! mempool runs standalone.
 //!
 //! ## Storage contract (FR30)
@@ -46,6 +46,7 @@ pub const NO_EXPIRY_SEQUENCE: u32 = u32::MAX;
 /// stays deliberately straightforward for Story 2.1; Story 2.2 may compact this
 /// further if the architecture §6.8 per-entry budget becomes load-bearing.
 #[derive(Copy, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct IndexEntry {
     start: u16,
     length: u16,
@@ -115,36 +116,42 @@ pub struct Mempool<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> {
 impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES, MAX_ENTRIES> {
     const COMPACT_BYTES_FITS_MAX_TRANSACTION: () = assert!(COMPACT_BYTES >= MAX_BLOCK_SIZE);
 
-    /// In-place construction for embedded/task use, and this type's **only**
-    /// constructor: writes directly into caller-provided `dst` instead of
-    /// returning `Self` by value.
+    /// Constructs the mempool in place, inside caller-provided storage, and
+    /// hands back a `&mut` to the initialized value. This is the type's
+    /// **only** constructor: there is no by-value `new()`.
     ///
     /// `compact_buffer` alone is ~20 KB at the architecture §5 default
     /// (`COMPACT_BYTES = 20160`) — large enough that, like
     /// `moonblokz_blockchain::api::Blockchain`, no construction technique
     /// *inside* a function that returns `Self` by value can avoid a
-    /// transient `size_of::<Self>()`-sized stack allocation somewhere. A
-    /// by-value `new()` existed earlier and was fine for the desktop
-    /// simulator and for tests, but it was removed once every caller was
-    /// confirmed able to use this constructor instead (same rationale as
-    /// `moonblokz_blockchain::api::Blockchain::init_in_place`'s doc comment).
-    /// See that type's `init_in_place` doc comment for the full mechanism
-    /// and the required usage pattern: call this from *inside* a
-    /// `#[embassy_executor::task]` fn, with the destination `MaybeUninit`
-    /// declared as a task-local kept alive across an `.await` — that is
-    /// what makes Rust's async state-machine lowering place it in the
-    /// task's static `TaskStorage` rather than the shared poll-time call
+    /// transient `size_of::<Self>()`-sized stack allocation somewhere.
+    /// Writing straight into `slot` sidesteps that floor entirely; see
+    /// `moonblokz_blockchain::api::Blockchain::init`'s doc comment for the
+    /// full mechanism and the required embedded usage pattern: call this
+    /// from *inside* a `#[embassy_executor::task]` fn, with the destination
+    /// `MaybeUninit` declared as a task-local kept alive across an `.await`
+    /// — that is what makes Rust's async state-machine lowering place it in
+    /// the task's static `TaskStorage` rather than the shared poll-time call
     /// stack.
     ///
     /// Per FR59, nothing is recovered from durable storage — the mempool is
     /// empty on restart by design.
     ///
-    /// # Safety
-    /// `dst` must be valid for writes of `Self` and not yet initialized.
-    /// Every field is written exactly once; no field is read before its
-    /// write. The precondition asserts run before any write, so a panic
-    /// there cannot leave `dst` partially initialized.
-    pub unsafe fn init_in_place(dst: *mut Self, sub_seed: u64, own_node_id: u32) {
+    /// This function is **safe**: a `&mut MaybeUninit<Self>` already
+    /// guarantees a non-null, aligned, exclusively borrowed destination that
+    /// is valid for writes, and the caller only receives the `&mut Self` once
+    /// every field has been written. The const-generic precondition asserts
+    /// run before the first write, and a panic there simply leaves `slot`
+    /// uninitialized — a safe state, nothing is dropped.
+    ///
+    /// # Panics
+    /// If `COMPACT_BYTES` does not fit the `u16` byte offsets or
+    /// `MAX_ENTRIES` does not fit the `u8` entry count.
+    pub fn init(
+        slot: &mut core::mem::MaybeUninit<Self>,
+        sub_seed: u64,
+        own_node_id: u32,
+    ) -> &mut Self {
         #[allow(clippy::let_unit_value)]
         let _ = Self::COMPACT_BYTES_FITS_MAX_TRANSACTION;
         assert!(
@@ -156,40 +163,65 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
             "MAX_ENTRIES must fit in the u8 entry_count"
         );
 
+        let p = slot.as_mut_ptr();
+        // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it
+        // is non-null, aligned, valid for writes of `Self` and not aliased.
+        // Every field is written below; none is read before its write.
         unsafe {
             // Plain all-zero byte buffer: `write_bytes` (memset) is both
             // correct (no representation ambiguity for `u8`) and never
             // materializes a `COMPACT_BYTES`-sized value anywhere, unlike
             // a bulk `.write([0u8; COMPACT_BYTES])` would.
-            let compact_buffer_ptr = core::ptr::addr_of_mut!((*dst).compact_buffer) as *mut u8;
+            let compact_buffer_ptr = (&raw mut (*p).compact_buffer).cast::<u8>();
             compact_buffer_ptr.write_bytes(0u8, COMPACT_BYTES);
 
             // `Option<IndexEntry>` has no guaranteed niche (`IndexEntry`
             // has no `NonZero`/reference field), so `None`'s bit pattern
             // isn't something safe code may assume is all-zero — write
             // real `None` values one at a time instead of memsetting.
-            let index_ptr = core::ptr::addr_of_mut!((*dst).index) as *mut Option<IndexEntry>;
+            let index_ptr = (&raw mut (*p).index).cast::<Option<IndexEntry>>();
             for i in 0..MAX_ENTRIES {
                 index_ptr.add(i).write(None);
             }
 
-            core::ptr::addr_of_mut!((*dst).prng).write(Xoshiro256PlusPlus::seed_from_u64(sub_seed));
-            core::ptr::addr_of_mut!((*dst).byte_usage).write(0);
-            core::ptr::addr_of_mut!((*dst).entry_count).write(0);
-            core::ptr::addr_of_mut!((*dst).own_node_id).write(own_node_id);
+            (&raw mut (*p).prng).write(Xoshiro256PlusPlus::seed_from_u64(sub_seed));
+            (&raw mut (*p).byte_usage).write(0);
+            (&raw mut (*p).entry_count).write(0);
+            (&raw mut (*p).own_node_id).write(own_node_id);
+        }
+        // SAFETY: every field of `Self` was written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a plain struct literal, which the language forces to
+    /// name every field, so adding a field to `Mempool` is a compile error
+    /// here until the literal — and therefore the specification — is updated.
+    /// The equivalence test then holds `init` to it field by field.
+    ///
+    /// Test-only: returning `Self` by value costs a `size_of::<Self>()`-sized
+    /// transient (~20 KB), which is exactly what `init` exists to avoid on
+    /// the embedded stack. Never a production code path.
+    #[cfg(test)]
+    fn new(sub_seed: u64, own_node_id: u32) -> Self {
+        Self {
+            compact_buffer: [0u8; COMPACT_BYTES],
+            index: [None; MAX_ENTRIES],
+            prng: Xoshiro256PlusPlus::seed_from_u64(sub_seed),
+            byte_usage: 0,
+            entry_count: 0,
+            own_node_id,
         }
     }
 
-    /// Test-only stand-in for the deleted by-value `new()`: wraps the
-    /// `MaybeUninit` + `init_in_place` + `assume_init()` calling convention
-    /// once so individual tests don't each repeat `unsafe` code.
+    /// Test-only stand-in that goes through the production path: runs
+    /// [`Self::init`] into a local slot and moves the finished value out.
     #[cfg(test)]
     fn new_for_test(sub_seed: u64, own_node_id: u32) -> Self {
         let mut slot = core::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            Self::init_in_place(slot.as_mut_ptr(), sub_seed, own_node_id);
-            slot.assume_init()
-        }
+        Self::init(&mut slot, sub_seed, own_node_id);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        unsafe { slot.assume_init() }
     }
 
     /// Returns the current number of indexed transactions.
@@ -1102,41 +1134,85 @@ mod tests {
         }
     }
 
-    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
-    /// `compact_buffer` filled via `write_bytes`, `index` filled
-    /// element-by-element) must land every field in its correct default
-    /// state — verified directly rather than trusted by construction.
+    /// `init`'s field writes (`compact_buffer` filled via `write_bytes`,
+    /// `index` filled element-by-element, the scalars written one by one)
+    /// must land every field in its correct default state — verified
+    /// directly rather than trusted by construction.
+    ///
+    /// The destructuring is deliberately exhaustive (no `..`): adding a field
+    /// to `Mempool` makes this test fail to *compile* until the new field is
+    /// both initialized and asserted here. Never compare two mempools
+    /// byte-for-byte for this purpose: padding bytes are uninitialized, and
+    /// Miri rejects reading them.
     #[test]
-    fn init_in_place_sets_expected_defaults() {
-        let mut result = core::mem::MaybeUninit::<TestMempool>::uninit();
-        let mp = unsafe {
-            TestMempool::init_in_place(result.as_mut_ptr(), 0xDEAD_BEEF, 7);
-            result.assume_init()
-        };
+    fn init_sets_expected_defaults() {
+        let mut slot = core::mem::MaybeUninit::<TestMempool>::uninit();
+        let mp = TestMempool::init(&mut slot, 0xDEAD_BEEF, 7);
 
-        assert_eq!(mp.entry_count(), 0);
-        assert_eq!(mp.byte_usage(), 0);
-        assert_eq!(mp.own_node_id, 7);
-        assert!(mp.compact_buffer.iter().all(|&b| b == 0));
-        assert!(mp.index.iter().all(|e| e.is_none()));
+        let Mempool {
+            compact_buffer,
+            index,
+            prng: _, // seeded from `sub_seed`; its state is opaque by design
+            byte_usage,
+            entry_count,
+            own_node_id,
+        } = &*mp;
+
+        assert!(compact_buffer.iter().all(|&b| b == 0));
+        assert!(index.iter().all(|e| e.is_none()));
+        assert_eq!(*byte_usage, 0);
+        assert_eq!(*entry_count, 0);
+        assert_eq!(*own_node_id, 7);
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces. Both sides are destructured exhaustively (no `..`), so a new
+    /// field cannot slip past either the literal in `new()` or this
+    /// comparison. Never compare the two byte-for-byte: padding is
+    /// uninitialized, and Miri rejects reading it.
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let mut slot = core::mem::MaybeUninit::<TestMempool>::uninit();
+        let built = TestMempool::init(&mut slot, 0xDEAD_BEEF, 7);
+        let spec = TestMempool::new(0xDEAD_BEEF, 7);
+
+        let Mempool {
+            compact_buffer,
+            index,
+            prng,
+            byte_usage,
+            entry_count,
+            own_node_id,
+        } = &*built;
+        let Mempool {
+            compact_buffer: spec_compact_buffer,
+            index: spec_index,
+            prng: spec_prng,
+            byte_usage: spec_byte_usage,
+            entry_count: spec_entry_count,
+            own_node_id: spec_own_node_id,
+        } = &spec;
+
+        assert!(compact_buffer[..] == spec_compact_buffer[..]);
+        assert!(index[..] == spec_index[..]);
+        assert!(prng == spec_prng);
+        assert_eq!(byte_usage, spec_byte_usage);
+        assert_eq!(entry_count, spec_entry_count);
+        assert_eq!(own_node_id, spec_own_node_id);
     }
 
     #[test]
     #[should_panic(expected = "COMPACT_BYTES must fit in u16 offsets")]
-    fn init_in_place_rejects_unsupported_compact_bytes() {
-        let mut result = core::mem::MaybeUninit::<Mempool<65536, 8>>::uninit();
-        unsafe {
-            Mempool::<65536, 8>::init_in_place(result.as_mut_ptr(), 0x1234, 42);
-        }
+    fn init_rejects_unsupported_compact_bytes() {
+        let mut slot = core::mem::MaybeUninit::<Mempool<65536, 8>>::uninit();
+        Mempool::<65536, 8>::init(&mut slot, 0x1234, 42);
     }
 
     #[test]
     #[should_panic(expected = "MAX_ENTRIES must fit in the u8 entry_count")]
-    fn init_in_place_rejects_unsupported_entry_count() {
-        let mut result = core::mem::MaybeUninit::<Mempool<2048, 256>>::uninit();
-        unsafe {
-            Mempool::<2048, 256>::init_in_place(result.as_mut_ptr(), 0x1234, 42);
-        }
+    fn init_rejects_unsupported_entry_count() {
+        let mut slot = core::mem::MaybeUninit::<Mempool<2048, 256>>::uninit();
+        Mempool::<2048, 256>::init(&mut slot, 0x1234, 42);
     }
 
     #[test]
