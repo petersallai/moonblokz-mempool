@@ -1613,7 +1613,7 @@ mod tests {
         assert_eq!(transaction_expiry_sequence(&tx), 0);
 
         let mut own_by_balance_output = ComplexTransaction::new(1);
-        assert!(own_by_balance_output.add_utxo_input(&hash, 0, &sig).is_ok());
+        assert!(own_by_balance_output.add_utxo_input(7, 0, &sig).is_ok());
         assert!(
             own_by_balance_output
                 .add_balance_output(OWN_NODE_ID, 50)
@@ -1634,7 +1634,7 @@ mod tests {
         assert_eq!(transaction_expiry_sequence(&tx), NO_EXPIRY_SEQUENCE);
 
         let mut utxo_only = ComplexTransaction::new(1);
-        assert!(utxo_only.add_utxo_input(&hash, 0, &sig).is_ok());
+        assert!(utxo_only.add_utxo_input(7, 0, &sig).is_ok());
         assert!(utxo_only.add_utxo_output(&hash, 50).is_ok());
         let tx = TransactionView::from_bytes(utxo_only.as_bytes()).unwrap();
         assert!(!is_own_transaction(&tx, OWN_NODE_ID));
