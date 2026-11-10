@@ -9,9 +9,15 @@ keywords = ["embedded", "no-std", "blockchain", "moonblokz", "mempool"]
 categories = ["embedded", "no-std"]
 
 [features]
-default = []
+default = ["schnorr-crypto-bigint", "block-size-2016"]
+# The crypto backend is the binary's choice, forwarded like the block-size tier.
+schnorr-crypto-bigint = ["moonblokz-chain-types/schnorr-crypto-bigint"]
+schnorr-malachite = ["moonblokz-chain-types/schnorr-malachite"]
+schnorr-num-bigint-dig = ["moonblokz-chain-types/schnorr-num-bigint-dig"]
+block-size-2016 = ["moonblokz-chain-types/block-size-2016"]
+block-size-65536 = ["moonblokz-chain-types/block-size-65536"]
 introspection = []
 
 [dependencies]
-moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false, features = ["schnorr-crypto-bigint"] }
+moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }

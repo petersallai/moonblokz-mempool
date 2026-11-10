@@ -48,8 +48,10 @@ pub const NO_EXPIRY_SEQUENCE: u32 = u32::MAX;
 #[derive(Copy, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 struct IndexEntry {
-    start: u16,
-    length: u16,
+    // `u32` offsets (DEC-223): the capacity stays at least one block, and a
+    // block-size tier above `u16` needs a compact buffer above 64 KB.
+    start: u32,
+    length: u32,
     // Hash lookup uses `hash_crc32` as a prefilter. Priority ordering and
     // later block assembly consume `transaction_fee`; it is supplied by the
     // blockchain caller at admission time so UTXO-backed complex fees are not
@@ -108,13 +110,22 @@ pub struct Mempool<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> {
     compact_buffer: [u8; COMPACT_BYTES],
     index: [Option<IndexEntry>; MAX_ENTRIES],
     prng: Xoshiro256PlusPlus,
-    byte_usage: u16,
-    entry_count: u8,
+    byte_usage: u32,
+    // `u16` (review of Story 6.15, decision (a)): a large block-size tier holds
+    // more than 255 transactions per block, and the mempool must hold one
+    // block's worth by count as well as by bytes (DEC-223).
+    entry_count: u16,
     own_node_id: u32,
 }
 
 impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES, MAX_ENTRIES> {
-    const COMPACT_BYTES_FITS_MAX_TRANSACTION: () = assert!(COMPACT_BYTES >= MAX_BLOCK_SIZE);
+    // A node that cannot hold a block's worth of transactions cannot take part
+    // in the network properly (FR56, DEC-223). A valid transaction never
+    // exceeds a block (the chain's limit is enforced at intake, Story 7.3), so
+    // this also keeps FR33's drain-to-admit termination exact.
+    const COMPACT_BYTES_FITS_A_BLOCK: () = assert!(COMPACT_BYTES >= MAX_BLOCK_SIZE);
+    // The index slots must be countable by `entry_count`.
+    const ENTRY_COUNT_FITS: () = assert!(MAX_ENTRIES <= u16::MAX as usize);
 
     /// Constructs the mempool in place, inside caller-provided storage, and
     /// hands back a `&mut` to the initialized value. This is the type's
@@ -145,22 +156,21 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     /// uninitialized — a safe state, nothing is dropped.
     ///
     /// # Panics
-    /// If `COMPACT_BYTES` does not fit the `u16` byte offsets or
-    /// `MAX_ENTRIES` does not fit the `u8` entry count.
+    /// If `COMPACT_BYTES` does not fit the `u32` byte offsets. A
+    /// `COMPACT_BYTES` below `MAX_BLOCK_SIZE` or a `MAX_ENTRIES` above the
+    /// `u16` entry count is a compile-time error, not a panic.
     pub fn init(
         slot: &mut core::mem::MaybeUninit<Self>,
         sub_seed: u64,
         own_node_id: u32,
     ) -> &mut Self {
         #[allow(clippy::let_unit_value)]
-        let _ = Self::COMPACT_BYTES_FITS_MAX_TRANSACTION;
+        let _ = Self::COMPACT_BYTES_FITS_A_BLOCK;
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::ENTRY_COUNT_FITS;
         assert!(
-            COMPACT_BYTES <= u16::MAX as usize,
-            "COMPACT_BYTES must fit in u16 offsets"
-        );
-        assert!(
-            MAX_ENTRIES <= u8::MAX as usize,
-            "MAX_ENTRIES must fit in the u8 entry_count"
+            COMPACT_BYTES <= u32::MAX as usize,
+            "COMPACT_BYTES must fit in u32 offsets"
         );
 
         let p = slot.as_mut_ptr();
@@ -225,13 +235,13 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     }
 
     /// Returns the current number of indexed transactions.
-    pub fn entry_count(&self) -> u8 {
+    pub fn entry_count(&self) -> u16 {
         self.entry_count
     }
 
     /// Returns the current byte-buffer usage. Useful for the FR30 contiguous-
     /// storage invariant verification.
-    pub fn byte_usage(&self) -> u16 {
+    pub fn byte_usage(&self) -> u32 {
         self.byte_usage
     }
 
@@ -248,7 +258,7 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         if (self.entry_count as usize) >= MAX_ENTRIES {
             return CapacityPressure::AtCapacity;
         }
-        // Compare against thresholds in u64 to avoid u16 overflow.
+        // Compare against thresholds in u64 to avoid u32 overflow.
         let bu = self.byte_usage as u64;
         let cap = COMPACT_BYTES as u64;
         let ec = self.entry_count as u64;
@@ -340,8 +350,8 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         let tx_hash = tx.hash();
 
         self.index[slot] = Some(IndexEntry {
-            start: start as u16,
-            length: tx_len as u16,
+            start: start as u32,
+            length: tx_len as u32,
             hash_crc32: crc32_ieee(&tx_hash),
             transaction_fee,
             expiry_sequence: transaction_expiry_sequence(&tx),
@@ -349,7 +359,7 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
             is_own: arriving_is_own,
         });
 
-        self.byte_usage += tx_len as u16;
+        self.byte_usage += tx_len as u32;
         self.entry_count += 1;
         AddResult::Admitted
     }
@@ -682,12 +692,12 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         // `last_original_start`.
         let survivor_total = self.index.iter().filter(|entry| entry.is_some()).count();
         let old_byte_usage = self.byte_usage as usize;
-        let mut write_offset = 0u16;
-        let mut last_original_start: Option<u16> = None;
+        let mut write_offset = 0u32;
+        let mut last_original_start: Option<u32> = None;
 
         for _ in 0..survivor_total {
             let mut next_slot: Option<usize> = None;
-            let mut next_start = u16::MAX;
+            let mut next_start = u32::MAX;
 
             for (slot, entry_opt) in self.index.iter().enumerate() {
                 let entry = match entry_opt {
@@ -727,7 +737,7 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
         }
 
         self.byte_usage = write_offset;
-        self.entry_count = survivor_total as u8;
+        self.entry_count = survivor_total as u16;
     }
 }
 
@@ -1004,7 +1014,13 @@ mod tests {
 
     // Test instance parameters: small COMPACT_BYTES and MAX_ENTRIES so we
     // can exercise the buffer-full / index-full rejection paths cheaply.
-    const TEST_COMPACT_BYTES: usize = 2048;
+    // At least one block (the `COMPACT_BYTES_FITS_A_BLOCK` invariant) on every
+    // block-size tier; 2048 on the reference tier.
+    const TEST_COMPACT_BYTES: usize = if MAX_BLOCK_SIZE > 2048 {
+        MAX_BLOCK_SIZE
+    } else {
+        2048
+    };
     const TEST_MAX_ENTRIES: usize = 8;
     type TestMempool = Mempool<TEST_COMPACT_BYTES, TEST_MAX_ENTRIES>;
 
@@ -1201,18 +1217,80 @@ mod tests {
         assert_eq!(own_node_id, spec_own_node_id);
     }
 
+    /// DEC-223: the index is `u32`, so a compact buffer above 64 KB (needed to
+    /// hold one block of a tier above `u16`) admits a transaction stored past
+    /// offset 65 535.
     #[test]
-    #[should_panic(expected = "COMPACT_BYTES must fit in u16 offsets")]
-    fn init_rejects_unsupported_compact_bytes() {
-        let mut slot = core::mem::MaybeUninit::<Mempool<65536, 8>>::uninit();
-        Mempool::<65536, 8>::init(&mut slot, 0x1234, 42);
+    fn a_transaction_is_stored_past_a_u16_offset() {
+        const BYTES: usize = 70_000;
+        type WideMempool = Mempool<BYTES, 128>;
+        let mut mp = WideMempool::new_for_test(0x1234, 42);
+        // One balance input and 138 balance outputs: 1890 B, the largest
+        // complex transaction a reference block fits. After 35 of them the
+        // buffer passes 65 535; the 36th then starts past it (35 × 1890).
+        for k in 0..40u64 {
+            if mp
+                .index
+                .iter()
+                .flatten()
+                .any(|e| e.start > u32::from(u16::MAX))
+            {
+                break;
+            }
+            let mut cx = ComplexTransaction::new(0);
+            assert!(
+                cx.add_balance_input(0, 1, 1_000_000 + k, 0, &[0; 64])
+                    .is_ok()
+            );
+            for receiver in 0..138u32 {
+                assert!(cx.add_balance_output(receiver, 1).is_ok());
+            }
+            let tx = TransactionView::from_bytes(cx.as_bytes()).unwrap();
+            assert!(matches!(
+                try_add_test_tx(&mut mp, tx, false),
+                AddResult::Admitted
+            ));
+        }
+        let past = mp
+            .index
+            .iter()
+            .flatten()
+            .max_by_key(|e| e.start)
+            .copied()
+            .unwrap();
+        assert!(
+            past.start > u32::from(u16::MAX),
+            "an entry starts past 65 535"
+        );
+        // And it reads back intact from there.
+        let start = past.start as usize;
+        let stored = &mp.compact_buffer[start..start + past.length as usize];
+        assert_eq!(stored.len(), 1890);
+        let hash = TransactionView::from_bytes(stored).unwrap().hash();
+        assert!(mp.contains(&hash));
     }
 
+    /// Review of Story 6.15, decision (a): `entry_count` is a `u16`, so a
+    /// mempool holds more than 255 transactions (a large-tier block's worth).
+    /// The `MAX_ENTRIES <= u16::MAX` bound is a compile-time assertion.
     #[test]
-    #[should_panic(expected = "MAX_ENTRIES must fit in the u8 entry_count")]
-    fn init_rejects_unsupported_entry_count() {
-        let mut slot = core::mem::MaybeUninit::<Mempool<2048, 256>>::uninit();
-        Mempool::<2048, 256>::init(&mut slot, 0x1234, 42);
+    fn more_than_255_entries_are_held() {
+        const MANY_BYTES: usize = if MAX_BLOCK_SIZE > 32_768 {
+            MAX_BLOCK_SIZE
+        } else {
+            32_768
+        };
+        type ManyMempool = Mempool<MANY_BYTES, 300>;
+        let mut mp = ManyMempool::new_for_test(0x1234, 42);
+        for amount in 0..300u64 {
+            let nt = sample_node_transfer(0, 1, 1_000 + amount);
+            let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+            assert!(matches!(
+                try_add_test_tx(&mut mp, tx, false),
+                AddResult::Admitted
+            ));
+        }
+        assert_eq!(mp.entry_count(), 300);
     }
 
     #[test]
@@ -1265,6 +1343,9 @@ mod tests {
         assert!(mp.contains(&arriving_hash));
     }
 
+    // Sized for the reference block (ten 189 B registrations fill 2016 B); a
+    // larger tier's minimum buffer would need a different fill.
+    #[cfg(feature = "block-size-2016")]
     #[test]
     fn try_add_at_buffer_full_triggers_case_1a_eviction() {
         // Use the minimum compile-time-supported capacity and enough slots so
@@ -1375,7 +1456,7 @@ mod tests {
 
         assert_eq!(mp.entry_count(), 2);
         // Buffer shrank.
-        let single_tx_len = nts[0].as_bytes().len() as u16;
+        let single_tx_len = nts[0].as_bytes().len() as u32;
         assert_eq!(mp.byte_usage(), single_tx_len * 2);
         // Surviving entries are present and findable.
         assert!(mp.contains(&hashes[0]));
@@ -1558,13 +1639,13 @@ mod tests {
             .index
             .iter()
             .filter_map(|e| e.as_ref())
-            .map(|e| e.length as u32)
+            .map(|e| e.length)
             .sum();
-        assert_eq!(total_bytes, mp.byte_usage() as u32);
+        assert_eq!(total_bytes, mp.byte_usage());
 
         // All occupied entries' start..start+length must be inside
         // [0, byte_usage) and must not overlap.
-        let mut intervals: [(u16, u16); 256] = [(0, 0); 256];
+        let mut intervals: [(u32, u32); 256] = [(0, 0); 256];
         let mut n = 0usize;
         for e in mp.index.iter().filter_map(|e| e.as_ref()) {
             intervals[n] = (e.start, e.length);
@@ -2147,9 +2228,9 @@ mod tests {
         fn run_ops(
             seed: u64,
         ) -> (
-            [Option<(u64, u32, u32, u32, u16, u16)>; TEST_MAX_ENTRIES],
+            [Option<(u64, u32, u32, u32, u32, u32)>; TEST_MAX_ENTRIES],
+            u32,
             u16,
-            u8,
         ) {
             let mut mp = TestMempool::new_for_test(seed, 42);
             // Fill with a mix of own and non-own
@@ -2165,7 +2246,7 @@ mod tests {
                 let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
                 let _ = try_add_test_tx(&mut mp, tx, false);
             }
-            let mut snapshot: [Option<(u64, u32, u32, u32, u16, u16)>; TEST_MAX_ENTRIES] =
+            let mut snapshot: [Option<(u64, u32, u32, u32, u32, u32)>; TEST_MAX_ENTRIES] =
                 [None; TEST_MAX_ENTRIES];
             for (i, e) in mp.index.iter().enumerate() {
                 snapshot[i] = e.as_ref().map(|entry| {
