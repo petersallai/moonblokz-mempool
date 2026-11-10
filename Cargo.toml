@@ -9,7 +9,9 @@ keywords = ["embedded", "no-std", "blockchain", "moonblokz", "mempool"]
 categories = ["embedded", "no-std"]
 
 [features]
-default = []
+default = ["block-size-2016"]
+block-size-2016 = ["moonblokz-chain-types/block-size-2016"]
+block-size-65536 = ["moonblokz-chain-types/block-size-65536"]
 introspection = []
 
 [dependencies]
