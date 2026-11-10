@@ -156,8 +156,9 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     /// uninitialized — a safe state, nothing is dropped.
     ///
     /// # Panics
-    /// If `COMPACT_BYTES` does not fit the `u32` byte offsets or
-    /// `MAX_ENTRIES` does not fit the `u8` entry count.
+    /// If `COMPACT_BYTES` does not fit the `u32` byte offsets. A
+    /// `COMPACT_BYTES` below `MAX_BLOCK_SIZE` or a `MAX_ENTRIES` above the
+    /// `u16` entry count is a compile-time error, not a panic.
     pub fn init(
         slot: &mut core::mem::MaybeUninit<Self>,
         sub_seed: u64,
