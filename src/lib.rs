@@ -498,13 +498,13 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     fn nth_own_slot(&self, n: usize) -> Option<usize> {
         let mut counter = 0usize;
         for (i, e) in self.index.iter().enumerate() {
-            if let Some(entry) = e {
-                if entry.is_own {
-                    if counter == n {
-                        return Some(i);
-                    }
-                    counter += 1;
+            if let Some(entry) = e
+                && entry.is_own
+            {
+                if counter == n {
+                    return Some(i);
                 }
+                counter += 1;
             }
         }
         None
@@ -514,13 +514,13 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     fn nth_non_own_slot(&self, n: usize) -> Option<usize> {
         let mut counter = 0usize;
         for (i, e) in self.index.iter().enumerate() {
-            if let Some(entry) = e {
-                if !entry.is_own {
-                    if counter == n {
-                        return Some(i);
-                    }
-                    counter += 1;
+            if let Some(entry) = e
+                && !entry.is_own
+            {
+                if counter == n {
+                    return Some(i);
                 }
+                counter += 1;
             }
         }
         None
@@ -626,32 +626,29 @@ impl<const COMPACT_BYTES: usize, const MAX_ENTRIES: usize> Mempool<COMPACT_BYTES
     where
         F: FnMut(u32) -> u64,
     {
-        for entry_opt in self.index.iter_mut() {
-            if let Some(entry) = entry_opt {
-                let start = entry.start as usize;
-                let len = entry.length as usize;
-                let tx_bytes = &self.compact_buffer[start..start + len];
-                let tx = match TransactionView::from_bytes(tx_bytes) {
-                    Some(v) => v,
-                    None => continue,
-                };
+        for entry in self.index.iter_mut().flatten() {
+            let start = entry.start as usize;
+            let len = entry.length as usize;
+            let tx_bytes = &self.compact_buffer[start..start + len];
+            let tx = match TransactionView::from_bytes(tx_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
 
-                let eligible = if let Some(nt) = tx.as_node_transfer() {
-                    balance_check(nt.initializer())
-                        >= nt.amount().saturating_add(entry.transaction_fee)
-                } else if let Some(reg) = tx.as_registration() {
-                    balance_check(reg.initializer())
-                        >= reg
-                            .registration_price()
-                            .saturating_add(entry.transaction_fee)
-                } else {
-                    // Complex transactions: Story 2.1 stub treats as eligible.
-                    // Proper multi-input UTXO eligibility lands in Story 7.3 / 7.5.
-                    true
-                };
+            let eligible = if let Some(nt) = tx.as_node_transfer() {
+                balance_check(nt.initializer()) >= nt.amount().saturating_add(entry.transaction_fee)
+            } else if let Some(reg) = tx.as_registration() {
+                balance_check(reg.initializer())
+                    >= reg
+                        .registration_price()
+                        .saturating_add(entry.transaction_fee)
+            } else {
+                // Complex transactions: Story 2.1 stub treats as eligible.
+                // Proper multi-input UTXO eligibility lands in Story 7.3 / 7.5.
+                true
+            };
 
-                entry.is_deferred = !eligible;
-            }
+            entry.is_deferred = !eligible;
         }
     }
 
@@ -2225,13 +2222,8 @@ mod tests {
     fn eviction_deterministic_from_seed() {
         // Two mempools with identical seed + identical op sequence must
         // reach identical state.
-        fn run_ops(
-            seed: u64,
-        ) -> (
-            [Option<(u64, u32, u32, u32, u32, u32)>; TEST_MAX_ENTRIES],
-            u32,
-            u16,
-        ) {
+        type Snapshot = [Option<(u64, u32, u32, u32, u32, u32)>; TEST_MAX_ENTRIES];
+        fn run_ops(seed: u64) -> (Snapshot, u32, u16) {
             let mut mp = TestMempool::new_for_test(seed, 42);
             // Fill with a mix of own and non-own
             for i in 0..TEST_MAX_ENTRIES {
@@ -2246,8 +2238,7 @@ mod tests {
                 let tx = TransactionView::from_bytes(nt.as_bytes()).unwrap();
                 let _ = try_add_test_tx(&mut mp, tx, false);
             }
-            let mut snapshot: [Option<(u64, u32, u32, u32, u32, u32)>; TEST_MAX_ENTRIES] =
-                [None; TEST_MAX_ENTRIES];
+            let mut snapshot: Snapshot = [None; TEST_MAX_ENTRIES];
             for (i, e) in mp.index.iter().enumerate() {
                 snapshot[i] = e.as_ref().map(|entry| {
                     (
