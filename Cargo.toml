@@ -22,7 +22,6 @@ introspection = []
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
 rand_xoshiro = { version = "0.7", default-features = false }
 
-
 # Debug test runs build the curve code optimized (DEC-255): a BLS pairing in an
 # unoptimized build is very slow. Only takes effect when this crate is the Cargo root.
 [profile.dev.package.moonblokz-crypto]

@@ -1223,9 +1223,10 @@ mod tests {
         const BYTES: usize = 70_000;
         type WideMempool = Mempool<BYTES, 128>;
         let mut mp = WideMempool::new_for_test(0x1234, 42);
-        // One balance input and up to 138 balance outputs, as many as the
-        // builder admits (1890 B under Schnorr, 1874 B under min-sig, 1857 B
-        // under min-pk): after about 35 of them the buffer passes 65 535.
+        // One balance input and 138 balance outputs, or as many as the largest
+        // transaction admits where that is fewer (138 / 138 / 133 under
+        // schnorr / min-sig / min-pk: 1890 / 1874 / 1857 B). The 36th entry
+        // starts past 65 535 under schnorr and min-sig, the 37th under min-pk.
         const OUTPUTS: u32 = {
             let fit = (MAX_TRANSACTION_SIZE - 7 - (25 + SIGNATURE_SIZE)) / 13;
             if fit < 138 { fit as u32 } else { 138 }
