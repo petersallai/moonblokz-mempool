@@ -1008,6 +1008,7 @@ mod tests {
         ComplexTransaction, HEADER_SIZE, NODE_TRANSFER_SIZE, NodeTransfer,
         PAYLOAD_TYPE_TRANSACTION, REGISTRATION_SIZE, Registration,
     };
+    use moonblokz_chain_types::{MAX_TRANSACTION_SIZE, PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
     // Test instance parameters: small COMPACT_BYTES and MAX_ENTRIES so we
     // can exercise the buffer-full / index-full rejection paths cheaply.
@@ -1050,7 +1051,7 @@ mod tests {
         amount: u64,
         fee: u32,
     ) -> NodeTransfer {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         NodeTransfer::new(vote, anchor_sequence, initializer, 0, amount, fee, 0, &sig)
     }
 
@@ -1059,8 +1060,8 @@ mod tests {
     }
 
     fn sample_registration_with_fee(new_node_id: u32, fee: u64) -> Registration {
-        let pub_key = [0xBB; 32];
-        let sig = [0xCC; 64];
+        let pub_key = [0xBB; PUBLIC_KEY_SIZE];
+        let sig = [0xCC; SIGNATURE_SIZE];
         Registration::new(0, 0, new_node_id, 100, fee, &pub_key, &sig, &sig)
     }
 
@@ -1222,9 +1223,14 @@ mod tests {
         const BYTES: usize = 70_000;
         type WideMempool = Mempool<BYTES, 128>;
         let mut mp = WideMempool::new_for_test(0x1234, 42);
-        // One balance input and 138 balance outputs: 1890 B, the largest
-        // complex transaction a reference block fits. After 35 of them the
-        // buffer passes 65 535; the 36th then starts past it (35 × 1890).
+        // One balance input and up to 138 balance outputs, as many as the
+        // builder admits (1890 B under Schnorr, 1874 B under min-sig, 1857 B
+        // under min-pk): after about 35 of them the buffer passes 65 535.
+        const OUTPUTS: u32 = {
+            let fit = (MAX_TRANSACTION_SIZE - 7 - (25 + SIGNATURE_SIZE)) / 13;
+            if fit < 138 { fit as u32 } else { 138 }
+        };
+        const LEN: usize = 7 + 25 + SIGNATURE_SIZE + 13 * OUTPUTS as usize;
         for k in 0..40u64 {
             if mp
                 .index
@@ -1236,10 +1242,10 @@ mod tests {
             }
             let mut cx = ComplexTransaction::new(0);
             assert!(
-                cx.add_balance_input(0, 1, 1_000_000 + k, 0, &[0; 64])
+                cx.add_balance_input(0, 1, 1_000_000 + k, 0, &[0; SIGNATURE_SIZE])
                     .is_ok()
             );
-            for receiver in 0..138u32 {
+            for receiver in 0..OUTPUTS {
                 assert!(cx.add_balance_output(receiver, 1).is_ok());
             }
             let tx = TransactionView::from_bytes(cx.as_bytes()).unwrap();
@@ -1262,7 +1268,7 @@ mod tests {
         // And it reads back intact from there.
         let start = past.start as usize;
         let stored = &mp.compact_buffer[start..start + past.length as usize];
-        assert_eq!(stored.len(), 1890);
+        assert_eq!(stored.len(), LEN);
         let hash = TransactionView::from_bytes(stored).unwrap().hash();
         assert!(mp.contains(&hash));
     }
@@ -1272,10 +1278,11 @@ mod tests {
     /// The `MAX_ENTRIES <= u16::MAX` bound is a compile-time assertion.
     #[test]
     fn more_than_255_entries_are_held() {
-        const MANY_BYTES: usize = if MAX_BLOCK_SIZE > 32_768 {
+        // 300 node transfers (101 / 85 / 133 B per scheme), and at least a block.
+        const MANY_BYTES: usize = if MAX_BLOCK_SIZE > 300 * NODE_TRANSFER_SIZE {
             MAX_BLOCK_SIZE
         } else {
-            32_768
+            300 * NODE_TRANSFER_SIZE
         };
         type ManyMempool = Mempool<MANY_BYTES, 300>;
         let mut mp = ManyMempool::new_for_test(0x1234, 42);
@@ -1340,17 +1347,19 @@ mod tests {
         assert!(mp.contains(&arriving_hash));
     }
 
-    // Sized for the reference block (ten 189 B registrations fill 2016 B); a
-    // larger tier's minimum buffer would need a different fill.
+    // Sized for the reference block (ten 189 B registrations fill 2016 B under
+    // Schnorr; nine 221 B / seven 269 B under BLS); a larger tier's minimum
+    // buffer would need a different fill.
     #[cfg(feature = "block-size-2016")]
     #[test]
     fn try_add_at_buffer_full_triggers_case_1a_eviction() {
         // Use the minimum compile-time-supported capacity and enough slots so
-        // bytes, not the index, are the limiting bound. Ten registrations fit
-        // (10 × 189 = 1890); an eleventh would exceed 2048 bytes.
+        // bytes, not the index, are the limiting bound. FIT registrations fit
+        // (10 × 189 = 1890 under Schnorr); one more would exceed the buffer.
         const MIN_BYTES: usize = MAX_BLOCK_SIZE;
+        const FIT: usize = MIN_BYTES / REGISTRATION_SIZE;
         let mut mp: Mempool<MIN_BYTES, 32> = Mempool::new_for_test(0x1001, 42);
-        for i in 0..10 {
+        for i in 0..FIT {
             let reg = sample_registration(100 + i as u32); // non-own
             let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
             assert!(matches!(
@@ -1358,7 +1367,7 @@ mod tests {
                 AddResult::Admitted
             ));
         }
-        assert_eq!(mp.entry_count(), 10);
+        assert_eq!(mp.entry_count() as usize, FIT);
         assert!(mp.byte_usage() as usize + REGISTRATION_SIZE > MIN_BYTES);
 
         // Find a deterministic seed whose first Case 1 draw evicts an
@@ -1366,7 +1375,7 @@ mod tests {
         let mut admitted = false;
         for seed in 0..256u64 {
             let mut candidate: Mempool<MIN_BYTES, 32> = Mempool::new_for_test(seed, 42);
-            for i in 0..10 {
+            for i in 0..FIT {
                 let reg = sample_registration(100 + i as u32);
                 let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
                 let _ = try_add_test_tx(&mut candidate, tx, false);
@@ -1378,7 +1387,7 @@ mod tests {
                 AddResult::Admitted
             ) {
                 admitted = true;
-                assert_eq!(candidate.entry_count(), 10);
+                assert_eq!(candidate.entry_count() as usize, FIT);
                 assert!(
                     candidate.contains(
                         &TransactionView::from_bytes(arriving.as_bytes())
@@ -1677,8 +1686,8 @@ mod tests {
     #[test]
     fn own_classification_follows_resolved_complex_policy() {
         const OWN_NODE_ID: u32 = 7;
-        let sig = [0xDD; 64];
-        let hash = [0xEE; 32];
+        let sig = [0xDD; SIGNATURE_SIZE];
+        let address = [0xEE; PUBLIC_KEY_SIZE];
 
         let mut own_by_balance_input = ComplexTransaction::new(1);
         assert!(
@@ -1713,7 +1722,7 @@ mod tests {
 
         let mut utxo_only = ComplexTransaction::new(1);
         assert!(utxo_only.add_utxo_input(7, 0, 50, &sig).is_ok());
-        assert!(utxo_only.add_utxo_output(&hash, 50).is_ok());
+        assert!(utxo_only.add_utxo_output(&address, 50).is_ok());
         let tx = TransactionView::from_bytes(utxo_only.as_bytes()).unwrap();
         assert!(!is_own_transaction(&tx, OWN_NODE_ID));
         assert_eq!(transaction_expiry_sequence(&tx), NO_EXPIRY_SEQUENCE);
@@ -1729,7 +1738,7 @@ mod tests {
         let tx = TransactionView::from_bytes(reg.as_bytes()).unwrap();
         assert_eq!(transaction_expiry_sequence(&tx), NO_EXPIRY_SEQUENCE);
 
-        let sig = [0xDD; 64];
+        let sig = [0xDD; SIGNATURE_SIZE];
         let mut complex = ComplexTransaction::new(1);
         assert!(complex.add_balance_input(42, 1, 50, 0, &sig).is_ok());
         assert!(complex.add_balance_input(7, 2, 25, 0, &sig).is_ok());
